@@ -3,7 +3,7 @@ import datetime as dt
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
-RAW_DATA_DIR = DATA_DIR / "processed"
+PROCESSED_DATA_DIR = DATA_DIR / "processed"
 
 END_YEAR =  dt.date.today().year +2
 START_YEAR = 2000
@@ -52,9 +52,9 @@ def create_basic_calendar(start_date: str, end_date: str) -> pd.DataFrame:
 
 def main():
     check_directory_exists(DATA_DIR)
-    check_directory_exists(RAW_DATA_DIR)
+    check_directory_exists(PROCESSED_DATA_DIR)
     
-    create_basic_calendar(f"{START_YEAR}-01-01", f"{END_YEAR}-12-31").to_csv(RAW_DATA_DIR / "basic_calendar.csv", index=False)
+    create_basic_calendar(f"{START_YEAR}-01-01", f"{END_YEAR}-12-31").to_csv(PROCESSED_DATA_DIR / "basic_calendar.csv", index=False)
     
 if __name__ == "__main__":
     main()
