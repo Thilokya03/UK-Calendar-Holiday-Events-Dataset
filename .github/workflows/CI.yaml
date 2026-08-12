@@ -51,7 +51,6 @@ jobs:
 
       - name: Collect source data
         run: |
-          
           python src/collectors/holiday_collectore.py
           python src/collectors/historical_holiday_collectore.py
           python src/collectors/event_pipeline.py
