@@ -52,8 +52,8 @@ jobs:
       - name: Collect source data
         run: |
           python src/collectors/extract_economic_data.py
-          python src/collectors/historical_holiday_collectore.py
           python src/collectors/holiday_collectore.py
+          python src/collectors/historical_holiday_collectore.py
           python src/collectors/event_pipeline.py
 
       - name: Merge calendar and economic features
