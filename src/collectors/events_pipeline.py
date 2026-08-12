@@ -3,49 +3,111 @@ from __future__ import annotations
 import re
 from io import StringIO
 from pathlib import Path
-from datetime import datetime
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ============================================================
 # 1. CONFIGURATION
 # ============================================================
 
+# Change this to 2010-01-01 if you only need data
+# matching the NESO demand period.
 START_DATE = pd.Timestamp("2000-01-01")
+
 END_DATE = pd.Timestamp.today().normalize()
+
+
+# ------------------------------------------------------------
+# Project root
+#
+# events_pipeline.py
+# └── collectors
+#     └── src
+#         └── PROJECT ROOT
+#
+# Therefore parents[2] is correct.
+# ------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
-RAW_DIR = BASE_DIR / "data" / "raw" / "events"
-PROCESSED_DIR = BASE_DIR / "data" / "processed"
-
-RAW_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-
 
 # ------------------------------------------------------------
-# Source URLs
+# Output directories
 # ------------------------------------------------------------
 
-PARLIAMENT_ELECTION_URL = (
-    "https://commonslibrary.parliament.uk/research-briefings/sn04512/"
+RAW_EVENT_DIR = (
+    BASE_DIR
+    / "data"
+    / "raw"
+    / "events"
 )
 
-FOOTBALL_RESULTS_URL = (
-    "https://raw.githubusercontent.com/"
-    "martj42/international_results/master/results.csv"
+SOURCE_DIR = (
+    RAW_EVENT_DIR
+    / "source"
 )
 
-ENGLAND_FOOTBALL_VERIFICATION_URL = (
-    "https://www.englandfootball.com/"
-    "england/mens-senior-team/fixtures-results"
+PROCESSED_DIR = (
+    BASE_DIR
+    / "data"
+    / "processed"
+)
+
+
+RAW_EVENT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+SOURCE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+PROCESSED_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
 )
 
 
 # ============================================================
-# 2. STANDARD EVENT SCHEMA
+# 2. RELIABLE DATA SOURCES
+# ============================================================
+
+# Official House of Commons Library
+PARLIAMENT_ELECTION_URL = (
+    "https://commonslibrary.parliament.uk/"
+    "research-briefings/sn04512/"
+)
+
+
+# Oxford COVID-19 Government Response Tracker
+OXFORD_COVID_URL = (
+    "https://raw.githubusercontent.com/"
+    "OxCGRT/"
+    "covid-policy-dataset/"
+    "main/"
+    "data/"
+    "OxCGRT_compact_national_v1.csv"
+)
+
+
+# Official England Football
+ENGLAND_FOOTBALL_URL = (
+    "https://www.englandfootball.com/"
+    "england/"
+    "mens-senior-team/"
+    "Legacy"
+)
+
+
+# ============================================================
+# 3. STANDARD EVENT FORMAT
 # ============================================================
 
 EVENT_COLUMNS = [
@@ -58,49 +120,125 @@ EVENT_COLUMNS = [
     "end_time",
     "all_day",
     "scope",
-    "importance",
-    "availability",
-    "use_for_forecast",
-    "source_type",
+    "competition",
+    "venue",
+    "event_level",
     "source_name",
     "source_url",
-    "notes",
 ]
 
 
 # ============================================================
-# 3. GENERAL HELPERS
+# 4. HTTP SESSION
 # ============================================================
 
-def download_text(url: str) -> str:
+def create_session() -> requests.Session:
     """
-    Download text/HTML/CSV from a URL.
+    Create HTTP session with retry support.
+
+    If a website temporarily returns errors such as:
+        429
+        500
+        502
+        503
+        504
+
+    the request will automatically retry.
     """
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 SmartGridForecaster/1.0 "
-            "(University research project)"
-        )
-    }
+    session = requests.Session()
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=60,
+    retry_strategy = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=2,
+        status_forcelist=[
+            429,
+            500,
+            502,
+            503,
+            504,
+        ],
+        allowed_methods=[
+            "GET"
+        ],
     )
 
-    response.raise_for_status()
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy
+    )
 
-    return response.text
+    session.mount(
+        "https://",
+        adapter,
+    )
+
+    session.mount(
+        "http://",
+        adapter,
+    )
+
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(compatible; "
+                "SmartGridForecaster/1.0; "
+                "University research project)"
+            )
+        }
+    )
+
+    return session
+
+
+SESSION = create_session()
+
+
+# ============================================================
+# 5. GENERAL HELPERS
+# ============================================================
+
+def normalize_text(text: str) -> str:
+    """
+    Normalize whitespace and special characters.
+    """
+
+    text = str(text)
+
+    text = text.replace(
+        "\xa0",
+        " ",
+    )
+
+    text = text.replace(
+        "–",
+        "-",
+    )
+
+    text = text.replace(
+        "—",
+        "-",
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
 
 
 def slugify(text: str) -> str:
     """
-    Convert text into a simple identifier.
+    Convert a string into an ID-friendly form.
     """
 
-    text = str(text).lower().strip()
+    text = normalize_text(text)
+
+    text = text.lower()
 
     text = re.sub(
         r"[^a-z0-9]+",
@@ -111,78 +249,113 @@ def slugify(text: str) -> str:
     return text.strip("_")
 
 
-def standardize_events(df: pd.DataFrame) -> pd.DataFrame:
+def download_html(
+    url: str,
+) -> str:
     """
-    Make every event dataset use exactly the same columns.
+    Download an HTML page.
     """
 
-    df = df.copy()
-
-    for column in EVENT_COLUMNS:
-        if column not in df.columns:
-            df[column] = ""
-
-    # If end_date is missing, use start_date.
-    missing_end = (
-        df["end_date"].isna()
-        | (df["end_date"].astype(str).str.strip() == "")
+    response = SESSION.get(
+        url,
+        timeout=120,
     )
 
-    df.loc[
-        missing_end,
-        "end_date"
-    ] = df.loc[
-        missing_end,
-        "start_date"
-    ]
+    response.raise_for_status()
 
-    # Standardize dates.
-    for column in ["start_date", "end_date"]:
+    return response.text
 
-        parsed = pd.to_datetime(
-            df[column],
-            errors="coerce",
-        )
 
-        df[column] = parsed.dt.strftime(
-            "%Y-%m-%d"
-        )
+def download_file(
+    url: str,
+    output_path: Path,
+) -> Path:
+    """
+    Download a file and store the original copy.
 
-    return df[EVENT_COLUMNS]
+    Useful for preserving the raw source data.
+    """
+
+    print(
+        f"Downloading:\n{url}"
+    )
+
+    with SESSION.get(
+        url,
+        timeout=180,
+        stream=True,
+    ) as response:
+
+        response.raise_for_status()
+
+        with open(
+            output_path,
+            "wb",
+        ) as file:
+
+            for chunk in response.iter_content(
+                chunk_size=1024 * 1024
+            ):
+
+                if chunk:
+
+                    file.write(
+                        chunk
+                    )
+
+    return output_path
+
+
+def save_dataframe(
+    df: pd.DataFrame,
+    path: Path,
+) -> None:
+    """
+    Save DataFrame as CSV.
+    """
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    df.to_csv(
+        path,
+        index=False,
+    )
+
+    print(
+        f"Saved {len(df):,} rows -> {path}"
+    )
 
 
 def generate_event_ids(
-    df: pd.DataFrame
+    df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Generate stable event IDs.
+    Generate event IDs from event type, date and name.
     """
 
     df = df.copy()
 
-    ids = []
-
-    for _, row in df.iterrows():
-
-        base = (
+    df["event_id"] = df.apply(
+        lambda row: slugify(
             f"{row['event_type']}_"
             f"{row['start_date']}_"
             f"{row['event_name']}"
-        )
+        ),
+        axis=1,
+    )
 
-        ids.append(
-            slugify(base)
-        )
-
-    df["event_id"] = ids
-
-    # In case two events accidentally have the same ID.
+    # Handle duplicate IDs
     duplicate_number = (
         df.groupby("event_id")
         .cumcount()
     )
 
-    duplicate_mask = duplicate_number > 0
+    duplicate_mask = (
+        duplicate_number > 0
+    )
 
     df.loc[
         duplicate_mask,
@@ -201,370 +374,1112 @@ def generate_event_ids(
     return df
 
 
-def save_dataset(
+def standardize_event_dataframe(
     df: pd.DataFrame,
-    path: Path,
-) -> None:
+) -> pd.DataFrame:
+    """
+    Ensure every event dataset has
+    exactly the same columns.
+    """
 
-    df.to_csv(
-        path,
-        index=False,
+    df = df.copy()
+
+    for column in EVENT_COLUMNS:
+
+        if column not in df.columns:
+
+            df[column] = ""
+
+    # ---------------------------------------------
+    # Dates
+    # ---------------------------------------------
+
+    df["start_date"] = pd.to_datetime(
+        df["start_date"],
+        errors="coerce",
+    )
+
+    df["end_date"] = pd.to_datetime(
+        df["end_date"],
+        errors="coerce",
+    )
+
+    # If no end date, event ends on start date.
+    df["end_date"] = (
+        df["end_date"]
+        .fillna(
+            df["start_date"]
+        )
+    )
+
+    # Remove invalid dates.
+    df = df.dropna(
+        subset=[
+            "start_date"
+        ]
+    )
+
+    # ---------------------------------------------
+    # Date range filter
+    # ---------------------------------------------
+
+    df = df[
+        (
+            df["start_date"]
+            >= START_DATE
+        )
+        &
+        (
+            df["start_date"]
+            <= END_DATE
+        )
+    ]
+
+    # ---------------------------------------------
+    # Convert dates to YYYY-MM-DD
+    # ---------------------------------------------
+
+    df["start_date"] = (
+        df["start_date"]
+        .dt.strftime(
+            "%Y-%m-%d"
+        )
+    )
+
+    df["end_date"] = (
+        df["end_date"]
+        .dt.strftime(
+            "%Y-%m-%d"
+        )
+    )
+
+    df = generate_event_ids(
+        df
+    )
+
+    return df[
+        EVENT_COLUMNS
+    ]
+
+
+# ============================================================
+# 6. ELECTION COLLECTOR
+# ============================================================
+
+def find_election_table(
+    html: str,
+) -> pd.DataFrame:
+    """
+    Find the historical UK General Election table
+    on the House of Commons Library page.
+
+    No election dates are manually entered here.
+    """
+
+    tables = pd.read_html(
+        StringIO(html)
+    )
+
+    best_table = None
+    best_score = 0
+
+    for table in tables:
+
+        if table.shape[1] < 2:
+            continue
+
+        first_column = (
+            table.iloc[:, 0]
+            .astype(str)
+            .map(normalize_text)
+        )
+
+        score = (
+            first_column
+            .str.contains(
+                r"\b(18|19|20)\d{2}\b",
+                regex=True,
+                na=False,
+            )
+            .sum()
+        )
+
+        if score > best_score:
+
+            best_score = score
+            best_table = table
+
+    if (
+        best_table is None
+        or best_score < 10
+    ):
+
+        raise RuntimeError(
+            "Could not identify the election table "
+            "on the House of Commons website."
+        )
+
+    return best_table
+
+
+def parse_election_date(
+    year: int,
+    date_text: str,
+):
+    """
+    Parse an election date from the official table.
+
+    Modern elections have a single polling day.
+
+    Older elections may contain ranges, but our
+    project begins much later than that period.
+    """
+
+    date_text = normalize_text(
+        date_text
+    )
+
+    # Remove text in brackets.
+    date_text = re.sub(
+        r"\([^)]*\)",
+        "",
+        date_text,
+    )
+
+    # If a range exists, take first polling date.
+    if " to " in date_text.lower():
+
+        date_text = re.split(
+            r"\s+to\s+",
+            date_text,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+
+    # Remove weekday.
+    date_text = re.sub(
+        (
+            r"^(Monday|Tuesday|Wednesday|"
+            r"Thursday|Friday|Saturday|Sunday)"
+            r"\s+"
+        ),
+        "",
+        date_text,
+        flags=re.IGNORECASE,
+    )
+
+    # Add year if not present.
+    if not re.search(
+        r"\b\d{4}\b",
+        date_text,
+    ):
+
+        date_text = (
+            f"{date_text} {year}"
+        )
+
+    return pd.to_datetime(
+        date_text,
+        dayfirst=True,
+        errors="coerce",
+    )
+
+
+def extract_elections_from_table(
+    table: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Extract the actual election records.
+    """
+
+    records = []
+
+    for _, row in table.iterrows():
+
+        values = [
+            normalize_text(value)
+            for value in row.tolist()
+        ]
+
+        if len(values) < 2:
+            continue
+
+        year_match = re.search(
+            r"\b((?:18|19|20)\d{2})\b",
+            values[0],
+        )
+
+        if not year_match:
+            continue
+
+        year = int(
+            year_match.group(1)
+        )
+
+        election_date = (
+            parse_election_date(
+                year,
+                values[1],
+            )
+        )
+
+        if pd.isna(
+            election_date
+        ):
+            continue
+
+        records.append(
+            {
+                "event_name":
+                    f"UK General Election {year}",
+
+                "event_type":
+                    "general_election",
+
+                "start_date":
+                    election_date,
+
+                "end_date":
+                    election_date,
+
+                "start_time":
+                    "",
+
+                "end_time":
+                    "",
+
+                "all_day":
+                    1,
+
+                "scope":
+                    "United Kingdom",
+
+                "competition":
+                    "",
+
+                "venue":
+                    "United Kingdom",
+
+                "event_level":
+                    "national",
+
+                "source_name":
+                    "House of Commons Library",
+
+                "source_url":
+                    PARLIAMENT_ELECTION_URL,
+            }
+        )
+
+    return pd.DataFrame(
+        records
+    )
+
+
+def extract_general_elections():
+    """
+    Complete election extraction process.
+    """
+
+    print(
+        "\n====================================="
     )
 
     print(
-        f"Saved {len(df):,} rows -> {path}"
+        "1. GENERAL ELECTIONS"
     )
 
-
-# ============================================================
-# 4. GENERAL ELECTION DATA
-# ============================================================
-
-def election_fallback() -> pd.DataFrame:
-    """
-    Fallback values from the official
-    House of Commons Library historical election table.
-
-    Used only if HTML extraction fails.
-    """
-
-    records = [
-        {
-            "event_name": "UK General Election 2010",
-            "event_type": "general_election",
-            "start_date": "2010-05-06",
-        },
-        {
-            "event_name": "UK General Election 2015",
-            "event_type": "general_election",
-            "start_date": "2015-05-07",
-        },
-        {
-            "event_name": "UK General Election 2017",
-            "event_type": "general_election",
-            "start_date": "2017-06-08",
-        },
-        {
-            "event_name": "UK General Election 2019",
-            "event_type": "general_election",
-            "start_date": "2019-12-12",
-        },
-        {
-            "event_name": "UK General Election 2024",
-            "event_type": "general_election",
-            "start_date": "2024-07-04",
-        },
-    ]
-
-    df = pd.DataFrame(records)
-
-    df["end_date"] = df["start_date"]
-
-    df["start_time"] = ""
-    df["end_time"] = ""
-
-    df["all_day"] = 1
-
-    df["scope"] = "United Kingdom"
-
-    df["importance"] = "high"
-
-    df["availability"] = "scheduled"
-
-    df["use_for_forecast"] = 1
-
-    df["source_type"] = "official"
-
-    df["source_name"] = (
-        "House of Commons Library"
+    print(
+        "====================================="
     )
 
-    df["source_url"] = (
+    print(
+        "Downloading House of Commons page..."
+    )
+
+    html = download_html(
         PARLIAMENT_ELECTION_URL
     )
 
-    df["notes"] = (
-        "Official UK General Election date."
+    # Save original HTML
+    html_path = (
+        SOURCE_DIR
+        / "parliament_elections.html"
     )
 
-    df = standardize_events(df)
+    html_path.write_text(
+        html,
+        encoding="utf-8",
+    )
 
-    return generate_event_ids(df)
+    print(
+        f"Raw HTML saved -> {html_path}"
+    )
+
+    table = find_election_table(
+        html
+    )
+
+    elections = (
+        extract_elections_from_table(
+            table
+        )
+    )
+
+    elections = (
+        standardize_event_dataframe(
+            elections
+        )
+    )
+
+    if elections.empty:
+
+        raise RuntimeError(
+            "Election extraction returned zero rows."
+        )
+
+    elections = (
+        elections
+        .sort_values(
+            "start_date"
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    save_dataframe(
+        elections,
+        RAW_EVENT_DIR
+        / "elections.csv",
+    )
+
+    print(
+        "\nElection dates extracted:"
+    )
+
+    print(
+        elections[
+            [
+                "start_date",
+                "event_name",
+            ]
+        ].to_string(
+            index=False
+        )
+    )
+
+    return elections
 
 
-def extract_general_elections() -> pd.DataFrame:
+# ============================================================
+# 7. COVID POLICY COLLECTOR
+# ============================================================
+
+def find_column_by_prefix(
+    df: pd.DataFrame,
+    prefix: str,
+) -> str:
     """
-    Extract UK General Election dates from
-    House of Commons Library.
+    Find a column even if Oxford later adds
+    small suffix changes to the dataset.
+    """
+
+    matches = [
+        column
+        for column in df.columns
+        if column.startswith(
+            prefix
+        )
+    ]
+
+    if not matches:
+
+        raise RuntimeError(
+            f"Column beginning with "
+            f"'{prefix}' was not found."
+        )
+
+    return matches[0]
+
+
+def load_oxford_data():
+    """
+    Download and load the original Oxford CSV.
     """
 
     print(
-        "\nExtracting General Elections..."
+        "\n====================================="
     )
 
-    try:
+    print(
+        "2. COVID POLICY DATA"
+    )
 
-        html = download_text(
-            PARLIAMENT_ELECTION_URL
+    print(
+        "====================================="
+    )
+
+    covid_raw_path = (
+        SOURCE_DIR
+        / "OxCGRT_compact_national_v1.csv"
+    )
+
+    download_file(
+        OXFORD_COVID_URL,
+        covid_raw_path,
+    )
+
+    print(
+        "Reading Oxford dataset..."
+    )
+
+    df = pd.read_csv(
+        covid_raw_path,
+        low_memory=False,
+    )
+
+    print(
+        f"Rows downloaded: {len(df):,}"
+    )
+
+    return df
+
+
+def extract_uk_covid_data(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Extract United Kingdom records.
+    """
+
+    required_columns = [
+        "CountryCode",
+        "Date",
+    ]
+
+    for column in required_columns:
+
+        if column not in df.columns:
+
+            raise RuntimeError(
+                f"Required Oxford column "
+                f"'{column}' is missing."
+            )
+
+    uk = df[
+        df["CountryCode"]
+        == "GBR"
+    ].copy()
+
+    if uk.empty:
+
+        raise RuntimeError(
+            "No GBR records found "
+            "in Oxford dataset."
         )
 
-        tables = pd.read_html(
-            StringIO(html)
+    # Oxford format is YYYYMMDD.
+    uk["Date"] = pd.to_datetime(
+        uk["Date"]
+        .astype(str)
+        .str.replace(
+            ".0",
+            "",
+            regex=False,
+        ),
+        format="%Y%m%d",
+        errors="coerce",
+    )
+
+    uk = uk.dropna(
+        subset=[
+            "Date"
+        ]
+    )
+
+    return uk
+
+
+def derive_covid_lockdown_periods(
+    uk: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Determine lockdown periods automatically.
+
+    OxCGRT:
+        C6 = Stay-at-home requirement
+
+        0 = none
+        1 = recommendation
+        2 = mandatory with exceptions
+        3 = mandatory with minimal exceptions
+
+    We define lockdown as C6 >= 2.
+    """
+
+    c6_column = (
+        find_column_by_prefix(
+            uk,
+            "C6M_Stay at home requirements",
+        )
+    )
+
+    print(
+        f"Using Oxford column: {c6_column}"
+    )
+
+    data = uk[
+        [
+            "Date",
+            c6_column,
+        ]
+    ].copy()
+
+    data = (
+        data.groupby(
+            "Date",
+            as_index=False,
+        )[c6_column]
+        .max()
+    )
+
+    data = data.sort_values(["Date"])
+
+    data["stay_home_level"] = (
+        pd.to_numeric(
+            data[c6_column],
+            errors="coerce",
+        )
+    )
+
+    data["is_lockdown"] = (
+        data["stay_home_level"]
+        >= 2
+    ).astype(int)
+
+    # ---------------------------------------------
+    # Detect a new period if:
+    #
+    # 1. restriction value changes
+    # OR
+    # 2. date sequence has a gap
+    # ---------------------------------------------
+
+    previous_lockdown = (
+        data["is_lockdown"]
+        .shift()
+    )
+
+    date_gap = (
+        data["Date"]
+        .diff()
+        .dt.days
+    )
+
+    new_period = (
+        data["is_lockdown"]
+        .ne(
+            previous_lockdown
+        )
+        |
+        date_gap.ne(1)
+    )
+
+    data["period_id"] = (
+        new_period
+        .cumsum()
+    )
+
+    lockdown_days = data[
+        data["is_lockdown"] == 1
+    ].copy()
+
+    if lockdown_days.empty:
+
+        raise RuntimeError(
+            "No mandatory lockdown periods "
+            "were found in Oxford data."
         )
 
-        election_table = None
+    periods = (
+        lockdown_days
+        .groupby(
+            "period_id"
+        )
+        .agg(
+            start_date=(
+                "Date",
+                "min",
+            ),
 
-        # Find table containing historical elections.
-        for table in tables:
+            end_date=(
+                "Date",
+                "max",
+            ),
 
-            text = " ".join(
-                table
-                .astype(str)
-                .fillna("")
-                .values
-                .ravel()
+            event_level=(
+                "stay_home_level",
+                "max",
+            ),
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    periods["event_name"] = (
+        "Mandatory COVID-19 "
+        "Stay-at-Home Requirement"
+    )
+
+    periods["event_type"] = (
+        "covid_lockdown"
+    )
+
+    periods["start_time"] = ""
+    periods["end_time"] = ""
+
+    periods["all_day"] = 1
+
+    periods["scope"] = (
+        "United Kingdom"
+    )
+
+    periods["competition"] = ""
+    periods["venue"] = ""
+
+    periods["source_name"] = (
+        "Oxford COVID-19 "
+        "Government Response Tracker"
+    )
+
+    periods["source_url"] = (
+        OXFORD_COVID_URL
+    )
+
+    return periods
+
+
+def extract_covid_events():
+    """
+    Complete Oxford COVID extraction.
+    """
+
+    df = load_oxford_data()
+
+    uk = extract_uk_covid_data(
+        df
+    )
+
+    print(
+        f"United Kingdom daily rows: "
+        f"{len(uk):,}"
+    )
+
+    lockdowns = (
+        derive_covid_lockdown_periods(
+            uk
+        )
+    )
+
+    lockdowns = (
+        standardize_event_dataframe(
+            lockdowns
+        )
+    )
+
+    lockdowns = (
+        lockdowns
+        .sort_values(
+            "start_date"
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    save_dataframe(
+        lockdowns,
+        RAW_EVENT_DIR
+        / "covid_restrictions.csv",
+    )
+
+    print(
+        "\nLockdown periods discovered "
+        "directly from Oxford data:"
+    )
+
+    print(
+        lockdowns[
+            [
+                "start_date",
+                "end_date",
+                "event_level",
+            ]
+        ].to_string(
+            index=False
+        )
+    )
+
+    return lockdowns
+
+
+# ============================================================
+# 8. FOOTBALL COLLECTOR
+# ============================================================
+
+GAME_PATTERN = re.compile(
+    r"^Game\s+(\d+)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
+DATE_PATTERN = re.compile(
+    (
+        r"\b("
+        r"\d{1,2}\s+"
+        r"(?:January|February|March|April|May|June|"
+        r"July|August|September|October|November|December)"
+        r"\s+\d{4}"
+        r")\b"
+    ),
+    re.IGNORECASE,
+)
+
+
+def football_page_lines(
+    html: str,
+) -> list[str]:
+    """
+    Convert England Football HTML into
+    normalized text lines.
+    """
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
+
+    lines = []
+
+    for value in soup.stripped_strings:
+
+        text = normalize_text(
+            value
+        )
+
+        if text:
+
+            lines.append(
+                text
             )
 
-            required_years = [
-                "2010",
-                "2015",
-                "2017",
-                "2019",
-                "2024",
+    return lines
+
+
+def split_game_blocks(
+    lines: list[str],
+):
+    """
+    Split the official page into:
+
+        Game 1001 ...
+        competition
+        date
+        venue
+        ...
+
+    blocks.
+    """
+
+    blocks = []
+
+    current_block = []
+
+    for line in lines:
+
+        if GAME_PATTERN.match(
+            line
+        ):
+
+            if current_block:
+
+                blocks.append(
+                    current_block
+                )
+
+            current_block = [
+                line
             ]
 
-            if all(
-                year in text
-                for year in required_years
-            ):
-                election_table = table
-                break
+        elif current_block:
 
-        if election_table is None:
-
-            raise ValueError(
-                "Election table not found."
+            current_block.append(
+                line
             )
 
-        records = []
+    if current_block:
 
-        for _, row in election_table.iterrows():
+        blocks.append(
+            current_block
+        )
 
-            values = [
-                str(value).strip()
-                for value in row.tolist()
-            ]
+    return blocks
 
-            if len(values) < 2:
-                continue
 
-            year_match = re.search(
-                r"\b(18|19|20)\d{2}\b",
-                values[0],
-            )
+def identify_major_competition(
+    block: list[str],
+):
+    """
+    Keep only major England tournament matches.
 
-            if not year_match:
-                continue
+    Included:
+        FIFA World Cup final tournament
+        World Cup Finals
+        UEFA EURO final tournament
+        European Championship Finals
 
-            year = int(
-                year_match.group()
-            )
+    Excluded:
+        qualifiers
+        friendlies
+        Nations League
+    """
 
-            if year < START_DATE.year:
-                continue
+    for line in block[1:]:
 
-            if year > END_DATE.year:
-                continue
+        lower = line.lower()
 
-            date_text = values[1]
+        # ---------------------------------------------
+        # Remove qualifying matches
+        # ---------------------------------------------
 
-            # Remove weekday.
-            date_text = re.sub(
-                r"^(Monday|Tuesday|Wednesday|"
-                r"Thursday|Friday|Saturday|Sunday)\s+",
-                "",
-                date_text,
-                flags=re.IGNORECASE,
-            )
+        if (
+            "qualifier" in lower
+            or "qualifying" in lower
+        ):
+            continue
 
-            parsed_date = pd.to_datetime(
-                f"{date_text} {year}",
+        # ---------------------------------------------
+        # FIFA World Cup
+        # ---------------------------------------------
+
+        if (
+            "world cup finals"
+            in lower
+        ):
+
+            return line
+
+        if (
+            "fifa world cup"
+            in lower
+            and "qualifier"
+            not in lower
+        ):
+
+            return line
+
+        # ---------------------------------------------
+        # EURO
+        # ---------------------------------------------
+
+        if (
+            "european championship finals"
+            in lower
+        ):
+
+            return line
+
+        if (
+            "uefa euro"
+            in lower
+            and "qualifier"
+            not in lower
+        ):
+
+            return line
+
+    return None
+
+
+def find_date_in_block(
+    block: list[str],
+):
+    """
+    Search the whole block for a date.
+
+    We search all lines because some historical
+    records contain dates inside explanatory text.
+    """
+
+    for line in block:
+
+        match = DATE_PATTERN.search(
+            line
+        )
+
+        if match:
+
+            parsed = pd.to_datetime(
+                match.group(1),
                 dayfirst=True,
                 errors="coerce",
             )
 
-            if pd.isna(parsed_date):
-                continue
+            if not pd.isna(
+                parsed
+            ):
 
-            records.append(
-                {
-                    "event_name":
-                        f"UK General Election {year}",
+                return parsed
 
-                    "event_type":
-                        "general_election",
-
-                    "start_date":
-                        parsed_date,
-
-                    "end_date":
-                        parsed_date,
-
-                    "start_time":
-                        "",
-
-                    "end_time":
-                        "",
-
-                    "all_day":
-                        1,
-
-                    "scope":
-                        "United Kingdom",
-
-                    "importance":
-                        "high",
-
-                    "availability":
-                        "scheduled",
-
-                    "use_for_forecast":
-                        1,
-
-                    "source_type":
-                        "official",
-
-                    "source_name":
-                        "House of Commons Library",
-
-                    "source_url":
-                        PARLIAMENT_ELECTION_URL,
-
-                    "notes":
-                        "Extracted from official historical election table.",
-                }
-            )
-
-        df = pd.DataFrame(records)
-
-        if df.empty:
-            raise ValueError(
-                "No election records extracted."
-            )
-
-        df = standardize_events(df)
-
-        return generate_event_ids(df)
-
-    except Exception as error:
-
-        print(
-            "Election extraction failed:"
-        )
-
-        print(error)
-
-        print(
-            "Using verified fallback dates."
-        )
-
-        return election_fallback()
+    return None
 
 
-# ============================================================
-# 5. FOOTBALL DATA
-# ============================================================
-
-def extract_major_football_events() -> pd.DataFrame:
+def find_venue_in_block(
+    block: list[str],
+    match_date,
+):
     """
-    Download historical international football results.
+    Try to extract the venue/location associated
+    with the match date.
 
-    Keep only England:
-        - FIFA World Cup finals tournament
-        - UEFA Euro finals tournament
+    Example source text:
 
-    Qualification matches and friendlies are excluded.
+        12 June 2010 - Rustenburg
+
+    We do not use strftime here because formats
+    such as %-d are not supported on Windows.
     """
 
-    print(
-        "\nExtracting England football events..."
-    )
+    if match_date is None:
+        return ""
 
-    csv_text = download_text(
-        FOOTBALL_RESULTS_URL
-    )
+    for line in block:
 
-    df = pd.read_csv(
-        StringIO(csv_text)
-    )
+        date_match = DATE_PATTERN.search(
+            line
+        )
 
-    df["date"] = pd.to_datetime(
-        df["date"],
-        errors="coerce",
-    )
+        if not date_match:
+            continue
 
-    # England must be playing.
-    england_mask = (
-        (df["home_team"] == "England")
-        |
-        (df["away_team"] == "England")
-    )
+        parsed_date = pd.to_datetime(
+            date_match.group(1),
+            dayfirst=True,
+            errors="coerce",
+        )
 
-    # Only major final tournaments.
-    tournament_mask = (
-        df["tournament"]
-        .isin(
-            [
-                "FIFA World Cup",
-                "UEFA Euro",
+        if pd.isna(parsed_date):
+            continue
+
+        # Make sure this date is actually
+        # the match date we are looking for.
+        if parsed_date.normalize() != match_date.normalize():
+            continue
+
+        # Everything following the date may
+        # contain the venue.
+        remainder = (
+            line[
+                date_match.end():
             ]
-        )
-    )
-
-    date_mask = (
-        (df["date"] >= START_DATE)
-        &
-        (df["date"] <= END_DATE)
-    )
-
-    df = df[
-        england_mask
-        &
-        tournament_mask
-        &
-        date_mask
-    ].copy()
-
-    events = []
-
-    for _, row in df.iterrows():
-
-        if row["home_team"] == "England":
-            opponent = row["away_team"]
-        else:
-            opponent = row["home_team"]
-
-        event_name = (
-            f"England vs {opponent} "
-            f"- {row['tournament']}"
+            .strip()
         )
 
-        events.append(
+        # Remove separators such as:
+        #
+        # 12 June 2010 - Rustenburg
+        #                ^
+        remainder = re.sub(
+            r"^[\s\-–—,:]+",
+            "",
+            remainder,
+        ).strip()
+
+        # Avoid accidentally storing an entire
+        # paragraph as the venue.
+        if (
+            remainder
+            and len(remainder) <= 100
+        ):
+            return remainder
+
+    return ""
+
+def parse_football_blocks(
+    blocks,
+) -> pd.DataFrame:
+    """
+    Extract major tournament matches.
+    """
+
+    records = []
+
+    for block in blocks:
+
+        game_match = GAME_PATTERN.match(
+            block[0]
+        )
+
+        if not game_match:
+            continue
+
+        game_number = int(
+            game_match.group(1)
+        )
+
+        result_text = normalize_text(
+            game_match.group(2)
+        )
+
+        competition = (
+            identify_major_competition(
+                block
+            )
+        )
+
+        if competition is None:
+            continue
+
+        match_date = (
+            find_date_in_block(
+                block
+            )
+        )
+
+        if match_date is None:
+            continue
+
+        if (
+            match_date < START_DATE
+            or match_date > END_DATE
+        ):
+            continue
+
+        venue = (
+            find_venue_in_block(
+                block,
+                match_date,
+            )
+        )
+
+        records.append(
             {
                 "event_name":
-                    event_name,
+                    f"England Match - {result_text}",
 
                 "event_type":
                     "major_football",
 
                 "start_date":
-                    row["date"],
+                    match_date,
 
                 "end_date":
-                    row["date"],
+                    match_date,
 
-                # This source contains the match date
-                # but not reliable kickoff-time information.
+                # Historical archive does not
+                # consistently supply kickoff time.
                 "start_time":
                     "",
 
@@ -577,828 +1492,299 @@ def extract_major_football_events() -> pd.DataFrame:
                 "scope":
                     "Great Britain",
 
-                "importance":
-                    "high",
+                "competition":
+                    competition,
 
-                "availability":
-                    "scheduled",
+                "venue":
+                    venue,
 
-                "use_for_forecast":
-                    1,
-
-                "source_type":
-                    "secondary_structured",
+                "event_level":
+                    "national",
 
                 "source_name":
-                    "martj42 international_results",
+                    "England Football / "
+                    "The Football Association",
 
                 "source_url":
-                    FOOTBALL_RESULTS_URL,
+                    ENGLAND_FOOTBALL_URL,
 
-                "notes":
-                    (
-                        "Major England tournament match. "
-                        "Verify final selected matches against "
-                        "England Football / UEFA / FIFA."
-                    ),
+                "_game_number":
+                    game_number,
             }
         )
 
-    events_df = pd.DataFrame(events)
-
-    events_df = standardize_events(
-        events_df
-    )
-
-    return generate_event_ids(
-        events_df
-    )
-
-
-# ============================================================
-# 6. COVID-19 EVENT DATA
-# ============================================================
-
-def create_covid_events() -> pd.DataFrame:
-    """
-    Important COVID restriction periods.
-
-    IMPORTANT:
-    These mainly represent England restrictions.
-
-    Because NESO represents Great Britain,
-    keep 'scope' in the dataset rather than
-    pretending all devolved nations had identical rules.
-    """
-
-    print(
-        "\nCreating COVID event data..."
-    )
-
-    records = [
-        {
-            "event_name":
-                "First COVID-19 national stay-at-home phase",
-
-            "event_type":
-                "covid_lockdown",
-
-            "start_date":
-                "2020-03-23",
-
-            "end_date":
-                "2020-05-12",
-
-            "scope":
-                "England",
-
-            "importance":
-                "very_high",
-
-            "source_name":
-                "Office for National Statistics",
-
-            "source_url":
-                (
-                    "https://www.ons.gov.uk/economy/"
-                    "economicoutputandproductivity/output/"
-                    "articles/coronavirushowpeopleandbusinesses"
-                    "haveadaptedtolockdowns/2021-03-19"
-                ),
-
-            "notes":
-                (
-                    "Modelled initial stay-at-home phase. "
-                    "Review boundaries if modelling "
-                    "England, Scotland and Wales separately."
-                ),
-        },
-
-        {
-            "event_name":
-                "Second COVID-19 national lockdown",
-
-            "event_type":
-                "covid_lockdown",
-
-            "start_date":
-                "2020-11-05",
-
-            "end_date":
-                "2020-12-01",
-
-            "scope":
-                "England",
-
-            "importance":
-                "very_high",
-
-            "source_name":
-                "GOV.UK",
-
-            "source_url":
-                (
-                    "https://gds.blog.gov.uk/"
-                    "2022/07/25/"
-                    "2-years-of-covid-19-on-gov-uk/"
-                ),
-
-            "notes":
-                "Second national lockdown in England.",
-        },
-
-        {
-            "event_name":
-                "Third COVID-19 national lockdown",
-
-            "event_type":
-                "covid_lockdown",
-
-            "start_date":
-                "2021-01-05",
-
-            "end_date":
-                "2021-03-07",
-
-            "scope":
-                "England",
-
-            "importance":
-                "very_high",
-
-            "source_name":
-                "GOV.UK",
-
-            "source_url":
-                (
-                    "https://www.gov.uk/government/"
-                    "publications/covid-19-response-spring-2021/"
-                    "covid-19-response-spring-2021-summary"
-                ),
-
-            "notes":
-                (
-                    "Initial third-lockdown phase "
-                    "before Step 1 reopening."
-                ),
-        },
-
-        {
-            "event_name":
-                "COVID Roadmap Step 1",
-
-            "event_type":
-                "covid_reopening",
-
-            "start_date":
-                "2021-03-08",
-
-            "end_date":
-                "2021-03-08",
-
-            "scope":
-                "England",
-
-            "importance":
-                "high",
-
-            "source_name":
-                "GOV.UK",
-
-            "source_url":
-                (
-                    "https://www.gov.uk/government/"
-                    "publications/covid-19-response-spring-2021/"
-                    "covid-19-response-spring-2021-summary"
-                ),
-
-            "notes":
-                "Schools reopened under Step 1.",
-        },
-
-        {
-            "event_name":
-                "COVID Roadmap Step 2",
-
-            "event_type":
-                "covid_reopening",
-
-            "start_date":
-                "2021-04-12",
-
-            "end_date":
-                "2021-04-12",
-
-            "scope":
-                "England",
-
-            "importance":
-                "high",
-
-            "source_name":
-                "GOV.UK",
-
-            "source_url":
-                (
-                    "https://www.gov.uk/government/"
-                    "publications/covid-19-response-spring-2021/"
-                    "covid-19-response-spring-2021-summary"
-                ),
-
-            "notes":
-                "Step 2 reopening.",
-        },
-
-        {
-            "event_name":
-                "COVID Roadmap Step 3",
-
-            "event_type":
-                "covid_reopening",
-
-            "start_date":
-                "2021-05-17",
-
-            "end_date":
-                "2021-05-17",
-
-            "scope":
-                "England",
-
-            "importance":
-                "high",
-
-            "source_name":
-                "GOV.UK",
-
-            "source_url":
-                (
-                    "https://www.gov.uk/government/"
-                    "publications/covid-19-response-spring-2021/"
-                    "covid-19-response-spring-2021-summary"
-                ),
-
-            "notes":
-                "Step 3 reopening.",
-        },
-    ]
-
-    df = pd.DataFrame(
+    return pd.DataFrame(
         records
     )
 
-    df["start_time"] = ""
-    df["end_time"] = ""
 
-    df["all_day"] = 1
-
-    df["availability"] = (
-        "policy_announced"
-    )
-
-    df["use_for_forecast"] = 1
-
-    df["source_type"] = "official"
-
-    df = standardize_events(df)
-
-    return generate_event_ids(df)
-
-
-# ============================================================
-# 7. ROYAL / NATIONAL EVENTS
-# ============================================================
-
-def create_royal_events() -> pd.DataFrame:
+def extract_football_events():
     """
-    Major Royal / national events from 2010 onward.
+    Complete official football extraction.
     """
 
     print(
-        "\nCreating Royal event data..."
+        "\n====================================="
     )
 
-    records = [
-        {
-            "event_name":
-                "Royal Wedding - William and Catherine",
-
-            "event_type":
-                "royal_event",
-
-            "start_date":
-                "2011-04-29",
-
-            "end_date":
-                "2011-04-29",
-
-            "start_time":
-                "11:00",
-
-            "end_time":
-                "",
-
-            "all_day":
-                0,
-
-            "scope":
-                "United Kingdom",
-
-            "importance":
-                "high",
-
-            "availability":
-                "scheduled",
-
-            "use_for_forecast":
-                1,
-
-            "source_type":
-                "official",
-
-            "source_name":
-                "The Royal Family",
-
-            "source_url":
-                (
-                    "https://www.royal.uk/"
-                    "wedding-prince-william-and-"
-                    "miss-catherine-middleton"
-                ),
-
-            "notes":
-                "Wedding service began at 11:00.",
-        },
-
-        {
-            "event_name":
-                "Queen Elizabeth II Diamond Jubilee Weekend",
-
-            "event_type":
-                "royal_event",
-
-            "start_date":
-                "2012-06-02",
-
-            "end_date":
-                "2012-06-05",
-
-            "start_time":
-                "",
-
-            "end_time":
-                "",
-
-            "all_day":
-                1,
-
-            "scope":
-                "United Kingdom",
-
-            "importance":
-                "high",
-
-            "availability":
-                "scheduled",
-
-            "use_for_forecast":
-                1,
-
-            "source_type":
-                "official",
-
-            "source_name":
-                "The Royal Family",
-
-            "source_url":
-                (
-                    "https://www.royal.uk/"
-                    "queen%E2%80%99s-diamond-jubilee-2012"
-                ),
-
-            "notes":
-                "Official Jubilee weekend 2-5 June.",
-        },
-
-        {
-            "event_name":
-                "Queen Elizabeth II Platinum Jubilee Weekend",
-
-            "event_type":
-                "royal_event",
-
-            "start_date":
-                "2022-06-02",
-
-            "end_date":
-                "2022-06-05",
-
-            "start_time":
-                "",
-
-            "end_time":
-                "",
-
-            "all_day":
-                1,
-
-            "scope":
-                "United Kingdom",
-
-            "importance":
-                "high",
-
-            "availability":
-                "scheduled",
-
-            "use_for_forecast":
-                1,
-
-            "source_type":
-                "official",
-
-            "source_name":
-                "The Royal Family",
-
-            "source_url":
-                (
-                    "https://www.royal.uk/"
-                    "platinum-jubilee-weekend"
-                ),
-
-            "notes":
-                "Four-day Platinum Jubilee weekend.",
-        },
-
-        {
-            "event_name":
-                "Death of Queen Elizabeth II",
-
-            "event_type":
-                "national_mourning",
-
-            "start_date":
-                "2022-09-08",
-
-            "end_date":
-                "2022-09-08",
-
-            "start_time":
-                "",
-
-            "end_time":
-                "",
-
-            "all_day":
-                1,
-
-            "scope":
-                "United Kingdom",
-
-            "importance":
-                "very_high",
-
-            "availability":
-                "unplanned",
-
-            # This event was not known in advance.
-            # Do not use the occurrence itself as
-            # a normal future-known predictor.
-            "use_for_forecast":
-                0,
-
-            "source_type":
-                "official",
-
-            "source_name":
-                "The Royal Family",
-
-            "source_url":
-                (
-                    "https://www.royal.uk/"
-                    "queen-elizabeth"
-                ),
-
-            "notes":
-                (
-                    "Keep for anomaly analysis. "
-                    "The death itself was not a "
-                    "future-known event."
-                ),
-        },
-
-        {
-            "event_name":
-                "State Funeral of Queen Elizabeth II",
-
-            "event_type":
-                "royal_event",
-
-            "start_date":
-                "2022-09-19",
-
-            "end_date":
-                "2022-09-19",
-
-            "start_time":
-                "11:00",
-
-            "end_time":
-                "",
-
-            "all_day":
-                0,
-
-            "scope":
-                "United Kingdom",
-
-            "importance":
-                "very_high",
-
-            "availability":
-                "scheduled",
-
-            "use_for_forecast":
-                1,
-
-            "source_type":
-                "official",
-
-            "source_name":
-                "The Royal Family",
-
-            "source_url":
-                (
-                    "https://www.royal.uk/"
-                    "news-and-activity/2022-09-19/"
-                    "the-state-funeral-for-her-"
-                    "majesty-the-queen"
-                ),
-
-            "notes":
-                "State Funeral began at 11:00.",
-        },
-
-        {
-            "event_name":
-                "Coronation of King Charles III",
-
-            "event_type":
-                "royal_event",
-
-            "start_date":
-                "2023-05-06",
-
-            "end_date":
-                "2023-05-06",
-
-            "start_time":
-                "11:00",
-
-            "end_time":
-                "",
-
-            "all_day":
-                0,
-
-            "scope":
-                "United Kingdom",
-
-            "importance":
-                "very_high",
-
-            "availability":
-                "scheduled",
-
-            "use_for_forecast":
-                1,
-
-            "source_type":
-                "official",
-
-            "source_name":
-                "The Royal Family",
-
-            "source_url":
-                (
-                    "https://www.royal.uk/"
-                    "coronation-weekend"
-                ),
-
-            "notes":
-                "Coronation service started at 11:00.",
-        },
-    ]
-
-    df = pd.DataFrame(
-        records
+    print(
+        "3. MAJOR FOOTBALL EVENTS"
     )
 
-    df = standardize_events(df)
+    print(
+        "====================================="
+    )
 
-    return generate_event_ids(df)
+    print(
+        "Downloading England Football archive..."
+    )
+
+    html = download_html(
+        ENGLAND_FOOTBALL_URL
+    )
+
+    html_path = (
+        SOURCE_DIR
+        / "england_football_legacy.html"
+    )
+
+    html_path.write_text(
+        html,
+        encoding="utf-8",
+    )
+
+    print(
+        f"Raw HTML saved -> {html_path}"
+    )
+
+    lines = football_page_lines(
+        html
+    )
+
+    print(
+        f"Page text lines: {len(lines):,}"
+    )
+
+    blocks = split_game_blocks(
+        lines
+    )
+
+    print(
+        f"Game blocks found: {len(blocks):,}"
+    )
+
+    matches = parse_football_blocks(
+        blocks
+    )
+
+    if matches.empty:
+
+        raise RuntimeError(
+            "No major England football matches "
+            "were extracted.\n"
+            "The England Football website "
+            "may have changed its structure."
+        )
+
+    if "_game_number" in matches.columns:
+
+        matches = matches.sort_values(
+            [
+                "start_date",
+                "_game_number",
+            ]
+        )
+
+        matches = matches.drop(
+            columns=[
+                "_game_number"
+            ]
+        )
+
+    matches = (
+        standardize_event_dataframe(
+            matches
+        )
+    )
+
+    matches = (
+        matches
+        .drop_duplicates(
+            subset=[
+                "start_date",
+                "event_name",
+            ]
+        )
+        .sort_values(
+            "start_date"
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    save_dataframe(
+        matches,
+        RAW_EVENT_DIR
+        / "football.csv",
+    )
+
+    print(
+        "\nMajor football matches extracted:"
+    )
+
+    print(
+        matches[
+            [
+                "start_date",
+                "event_name",
+                "competition",
+            ]
+        ].to_string(
+            index=False
+        )
+    )
+
+    return matches
 
 
 # ============================================================
-# 8. GRID / UNPLANNED ANOMALY EVENTS
+# 9. COMBINE ALL EVENTS
 # ============================================================
 
-def create_anomaly_events() -> pd.DataFrame:
+def combine_events(
+    elections: pd.DataFrame,
+    covid: pd.DataFrame,
+    football: pd.DataFrame,
+):
     """
-    Unplanned system events.
-
-    IMPORTANT:
-    These should normally NOT be features used
-    to predict future demand because they were
-    not known before they occurred.
-
-    They are useful for:
-        - EDA
-        - anomaly identification
-        - excluding unusual periods
-        - model-error analysis
+    Combine all event sources.
     """
 
     print(
-        "\nCreating anomaly event data..."
+        "\n====================================="
     )
 
-    records = [
-        {
-            "event_name":
-                "Great Britain Power System Disruption",
-
-            "event_type":
-                "grid_disruption",
-
-            "start_date":
-                "2019-08-09",
-
-            "end_date":
-                "2019-08-09",
-
-            "start_time":
-                "16:52",
-
-            "end_time":
-                "",
-
-            "all_day":
-                0,
-
-            "scope":
-                "Great Britain",
-
-            "importance":
-                "very_high",
-
-            "availability":
-                "unplanned",
-
-            # CRITICAL:
-            "use_for_forecast":
-                0,
-
-            "source_type":
-                "official",
-
-            "source_name":
-                "Ofgem",
-
-            "source_url":
-                (
-                    "https://www.ofgem.gov.uk/"
-                    "publications/investigation-"
-                    "9-august-2019-power-outage"
-                ),
-
-            "notes":
-                (
-                    "Unplanned grid event. "
-                    "Use as anomaly label, "
-                    "not a future-known forecasting feature."
-                ),
-        }
-    ]
-
-    df = pd.DataFrame(
-        records
+    print(
+        "4. COMBINING EVENT DATA"
     )
 
-    df = standardize_events(df)
+    print(
+        "====================================="
+    )
 
-    return generate_event_ids(df)
-
-
-# ============================================================
-# 9. COMBINE ALL EVENT DATA
-# ============================================================
-
-def combine_event_datasets(
-    event_datasets: list[pd.DataFrame],
-) -> pd.DataFrame:
-
-    combined = pd.concat(
-        event_datasets,
+    events = pd.concat(
+        [
+            elections,
+            covid,
+            football,
+        ],
         ignore_index=True,
+        sort=False,
     )
 
-    combined = combined.drop_duplicates(
-        subset=[
-            "event_name",
-            "event_type",
-            "start_date",
-            "end_date",
-        ]
-    )
-
-    combined["start_date_dt"] = (
+    events["start_date_sort"] = (
         pd.to_datetime(
-            combined["start_date"],
+            events["start_date"],
             errors="coerce",
         )
     )
 
-    combined = combined[
-        (
-            combined["start_date_dt"]
-            >= START_DATE
+    events = (
+        events
+        .drop_duplicates(
+            subset=[
+                "event_name",
+                "event_type",
+                "start_date",
+                "end_date",
+            ]
         )
-        &
-        (
-            combined["start_date_dt"]
-            <= END_DATE
+        .sort_values(
+            [
+                "start_date_sort",
+                "event_type",
+            ]
         )
-    ]
-
-    combined = combined.sort_values(
-        [
-            "start_date_dt",
-            "event_type",
-        ]
+        .drop(
+            columns=[
+                "start_date_sort"
+            ]
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
-    combined = combined.drop(
-        columns=[
-            "start_date_dt"
-        ]
+    output_path = (
+        PROCESSED_DIR
+        / "events.csv"
     )
 
-    combined = combined.reset_index(
-        drop=True
+    save_dataframe(
+        events,
+        output_path,
     )
 
-    return combined
+    return events
 
 
 # ============================================================
-# 10. EXPAND EVENTS INTO DAILY ROWS
+# 10. EXPAND EVENT DATE RANGES
 # ============================================================
 
-def expand_events_to_daily(
+def expand_events_to_days(
     events: pd.DataFrame,
-    forecast_only: bool = True,
-) -> pd.DataFrame:
+):
     """
-    Convert:
+    Example:
 
-        2022-06-02 -> 2022-06-05
+    lockdown:
+        2020-03-23 -> 2020-05-10
 
-    into:
+    becomes:
 
-        2022-06-02
-        2022-06-03
-        2022-06-04
-        2022-06-05
+        2020-03-23
+        2020-03-24
+        2020-03-25
+        ...
+        2020-05-10
+
+    This is required before joining with
+    daily/hourly electricity-demand data.
     """
-
-    working = events.copy()
-
-    if forecast_only:
-
-        working = working[
-            working["use_for_forecast"] == 1
-        ]
 
     rows = []
 
-    for _, event in working.iterrows():
+    for _, event in events.iterrows():
 
-        start = pd.to_datetime(
-            event["start_date"]
+        start_date = pd.to_datetime(
+            event["start_date"],
+            errors="coerce",
         )
 
-        end = pd.to_datetime(
-            event["end_date"]
+        end_date = pd.to_datetime(
+            event["end_date"],
+            errors="coerce",
         )
 
-        dates = pd.date_range(
-            start=start,
-            end=end,
+        if pd.isna(
+            start_date
+        ):
+            continue
+
+        if pd.isna(
+            end_date
+        ):
+            end_date = start_date
+
+        date_range = pd.date_range(
+            start=start_date,
+            end=end_date,
             freq="D",
         )
 
-        for date in dates:
+        for date in date_range:
 
             rows.append(
                 {
@@ -1406,76 +1792,94 @@ def expand_events_to_daily(
                         date,
 
                     "event_id":
-                        event["event_id"],
+                        event[
+                            "event_id"
+                        ],
 
                     "event_name":
-                        event["event_name"],
+                        event[
+                            "event_name"
+                        ],
 
                     "event_type":
-                        event["event_type"],
-
-                    "importance":
-                        event["importance"],
-
-                    "scope":
-                        event["scope"],
+                        event[
+                            "event_type"
+                        ],
                 }
             )
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(
+        rows
+    )
 
 
 # ============================================================
-# 11. CREATE ML DAILY EVENT FEATURES
+# 11. CREATE DAILY ML FEATURES
 # ============================================================
 
 def create_daily_event_features(
     events: pd.DataFrame,
-) -> pd.DataFrame:
+):
+    """
+    Create one row for every calendar date.
 
-    daily_long = expand_events_to_daily(
-        events,
-        forecast_only=True,
+    Output example:
+
+    date
+    is_event_day
+    is_general_election
+    is_covid_lockdown
+    is_major_football
+    event_count
+    event_names
+    """
+
+    print(
+        "\n====================================="
     )
 
-    if daily_long.empty:
+    print(
+        "5. CREATING DAILY FEATURES"
+    )
 
-        return pd.DataFrame(
-            columns=["date"]
+    print(
+        "====================================="
+    )
+
+    calendar = pd.DataFrame(
+        {
+            "date":
+                pd.date_range(
+                    start=START_DATE,
+                    end=END_DATE,
+                    freq="D",
+                )
+        }
+    )
+
+    long_events = (
+        expand_events_to_days(
+            events
+        )
+    )
+
+    if long_events.empty:
+
+        raise RuntimeError(
+            "No event days available."
         )
 
-    importance_values = {
-        "low": 1,
-        "medium": 2,
-        "high": 3,
-        "very_high": 4,
-    }
+    # ---------------------------------------------
+    # Event count
+    # ---------------------------------------------
 
-    daily_long[
-        "importance_score"
-    ] = (
-        daily_long["importance"]
-        .map(importance_values)
-        .fillna(0)
-        .astype(int)
-    )
-
-    # --------------------------------------------------------
-    # Number of events per day
-    # --------------------------------------------------------
-
-    summary = (
-        daily_long
+    event_count = (
+        long_events
         .groupby("date")
         .agg(
             event_count=(
                 "event_id",
                 "nunique",
-            ),
-
-            max_event_importance=(
-                "importance_score",
-                "max",
             ),
 
             event_names=(
@@ -1491,46 +1895,101 @@ def create_daily_event_features(
         .reset_index()
     )
 
-    # --------------------------------------------------------
-    # Binary feature for each event type
-    # --------------------------------------------------------
+    # ---------------------------------------------
+    # One-hot event types
+    # ---------------------------------------------
 
-    event_flags = pd.crosstab(
-        daily_long["date"],
-        daily_long["event_type"],
+    flags = pd.crosstab(
+        long_events["date"],
+        long_events["event_type"],
     )
 
-    event_flags = (
-        event_flags > 0
+    flags = (
+        flags > 0
     ).astype(int)
 
-    event_flags.columns = [
+    flags.columns = [
         f"is_{slugify(column)}"
-        for column
-        in event_flags.columns
+        for column in flags.columns
     ]
 
-    event_flags = (
-        event_flags
-        .reset_index()
-    )
+    flags = flags.reset_index()
 
-    output = summary.merge(
-        event_flags,
+    # ---------------------------------------------
+    # Merge into full calendar
+    # ---------------------------------------------
+
+    features = calendar.merge(
+        event_count,
         on="date",
         how="left",
     )
 
-    # General event indicator.
-    output["is_event_day"] = (
-        output["event_count"] > 0
-    ).astype(int)
-
-    output = output.sort_values(
-        "date"
+    features = features.merge(
+        flags,
+        on="date",
+        how="left",
     )
 
-    return output
+    # ---------------------------------------------
+    # Fill normal days
+    # ---------------------------------------------
+
+    features["event_count"] = (
+        features["event_count"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    features["event_names"] = (
+        features["event_names"]
+        .fillna("")
+    )
+
+    flag_columns = [
+        column
+        for column
+        in features.columns
+        if column.startswith(
+            "is_"
+        )
+    ]
+
+    for column in flag_columns:
+
+        features[column] = (
+            features[column]
+            .fillna(0)
+            .astype(int)
+        )
+
+    features["is_event_day"] = (
+        features["event_count"]
+        > 0
+    ).astype(int)
+
+    # ---------------------------------------------
+    # Date formatting
+    # ---------------------------------------------
+
+    features["date"] = (
+        features["date"]
+        .dt.strftime(
+            "%Y-%m-%d"
+        )
+    )
+
+    output_path = (
+        PROCESSED_DIR
+        / "event_daily_features.csv"
+    )
+
+    save_dataframe(
+        features,
+        output_path,
+    )
+
+    return features
 
 
 # ============================================================
@@ -1538,29 +1997,90 @@ def create_daily_event_features(
 # ============================================================
 
 def validate_events(
-    events: pd.DataFrame
-) -> None:
+    events: pd.DataFrame,
+):
+    """
+    Basic data-quality checks.
+    """
 
     print(
-        "\n=============================="
+        "\n====================================="
     )
 
     print(
-        "EVENT DATA VALIDATION"
+        "6. VALIDATION"
     )
 
     print(
-        "=============================="
+        "====================================="
     )
+
+    if events.empty:
+
+        raise ValueError(
+            "Event dataset is empty."
+        )
+
+    # ---------------------------------------------
+    # Missing values
+    # ---------------------------------------------
+
+    if events[
+        "start_date"
+    ].isna().any():
+
+        raise ValueError(
+            "Missing event start dates found."
+        )
+
+    # ---------------------------------------------
+    # Date order
+    # ---------------------------------------------
+
+    start_dates = pd.to_datetime(
+        events["start_date"],
+        errors="coerce",
+    )
+
+    end_dates = pd.to_datetime(
+        events["end_date"],
+        errors="coerce",
+    )
+
+    invalid_ranges = events[
+        end_dates < start_dates
+    ]
+
+    if not invalid_ranges.empty:
+
+        raise ValueError(
+            "Invalid event date ranges found."
+        )
+
+    # ---------------------------------------------
+    # Duplicate check
+    # ---------------------------------------------
+
+    duplicates = events.duplicated(
+        subset=[
+            "event_name",
+            "event_type",
+            "start_date",
+        ]
+    )
+
+    if duplicates.any():
+
+        print(
+            "WARNING: Duplicate events exist."
+        )
 
     print(
         f"Total events: {len(events):,}"
     )
 
-    print()
-
     print(
-        "Events by type:"
+        "\nEvents by type:"
     )
 
     print(
@@ -1569,83 +2089,18 @@ def validate_events(
         ].value_counts()
     )
 
-    print()
-
     print(
-        "Events by source type:"
+        "\nDate range:"
     )
 
     print(
-        events[
-            "source_type"
-        ].value_counts()
-    )
-
-    print()
-
-    print(
-        "Forecast-safe:"
+        events["start_date"].min(),
+        "->",
+        events["start_date"].max(),
     )
 
     print(
-        events[
-            "use_for_forecast"
-        ].value_counts()
-    )
-
-    # --------------------------------------------------------
-    # Missing dates
-    # --------------------------------------------------------
-
-    missing_dates = events[
-        events["start_date"].isna()
-    ]
-
-    if not missing_dates.empty:
-
-        print(
-            "\nWARNING: Missing dates found."
-        )
-
-        print(
-            missing_dates[
-                [
-                    "event_name",
-                    "event_type",
-                ]
-            ]
-        )
-
-    # --------------------------------------------------------
-    # Invalid date ranges
-    # --------------------------------------------------------
-
-    start = pd.to_datetime(
-        events["start_date"],
-        errors="coerce",
-    )
-
-    end = pd.to_datetime(
-        events["end_date"],
-        errors="coerce",
-    )
-
-    invalid_range = events[
-        end < start
-    ]
-
-    if not invalid_range.empty:
-
-        print(
-            "\nWARNING: Invalid date ranges."
-        )
-
-        print(
-            invalid_range
-        )
-
-    print(
-        "\nValidation complete."
+        "\nValidation successful."
     )
 
 
@@ -1656,123 +2111,122 @@ def validate_events(
 def main():
 
     print(
-        "====================================="
+        "\n========================================="
     )
 
     print(
-        "SMART GRID EVENT DATA PIPELINE"
+        "UK EVENT DATA COLLECTION PIPELINE"
     )
 
     print(
-        "====================================="
+        "========================================="
     )
 
     print(
-        f"Start date : {START_DATE.date()}"
+        f"Project root : {BASE_DIR}"
     )
 
     print(
-        f"End date   : {END_DATE.date()}"
+        f"Start date   : {START_DATE.date()}"
     )
 
-    # --------------------------------------------------------
-    # Extract / create source datasets
-    # --------------------------------------------------------
+    print(
+        f"End date     : {END_DATE.date()}"
+    )
+
+    print(
+        f"Raw directory: {RAW_EVENT_DIR}"
+    )
+
+    # ========================================================
+    # STEP 1
+    # ========================================================
 
     elections = (
         extract_general_elections()
     )
 
-    football = (
-        extract_major_football_events()
-    )
+    # ========================================================
+    # STEP 2
+    # ========================================================
 
     covid = (
-        create_covid_events()
+        extract_covid_events()
     )
 
-    royal = (
-        create_royal_events()
+    # ========================================================
+    # STEP 3
+    # ========================================================
+
+    football = (
+        extract_football_events()
     )
 
-    anomalies = (
-        create_anomaly_events()
-    )
+    # ========================================================
+    # STEP 4
+    # ========================================================
 
-    # --------------------------------------------------------
-    # Save raw source files
-    # --------------------------------------------------------
-
-    save_dataset(
+    events = combine_events(
         elections,
-        RAW_DIR / "elections.csv",
-    )
-
-    save_dataset(
-        football,
-        RAW_DIR / "football_events.csv",
-    )
-
-    save_dataset(
         covid,
-        RAW_DIR / "covid_events.csv",
+        football,
     )
 
-    save_dataset(
-        royal,
-        RAW_DIR / "royal_events.csv",
+    # ========================================================
+    # STEP 5
+    # ========================================================
+
+    create_daily_event_features(
+        events
     )
 
-    save_dataset(
-        anomalies,
-        RAW_DIR / "anomaly_events.csv",
-    )
-
-    # --------------------------------------------------------
-    # Combine
-    # --------------------------------------------------------
-
-    events = combine_event_datasets(
-        [
-            elections,
-            football,
-            covid,
-            royal,
-            anomalies,
-        ]
-    )
-
-    save_dataset(
-        events,
-        PROCESSED_DIR / "gb_events.csv",
-    )
-
-    # --------------------------------------------------------
-    # Generate ML-safe daily features
-    # --------------------------------------------------------
-
-    daily_features = (
-        create_daily_event_features(
-            events
-        )
-    )
-
-    save_dataset(
-        daily_features,
-        PROCESSED_DIR
-        / "gb_event_daily_features.csv",
-    )
-
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
+    # ========================================================
+    # STEP 6
+    # ========================================================
 
     validate_events(
         events
     )
 
     print(
-        "\nPipeline completed successfully."
+        "\n========================================="
+    )
+
+    print(
+        "PIPELINE COMPLETED SUCCESSFULLY"
+    )
+
+    print(
+        "========================================="
+    )
+
+    print(
+        "\nGenerated files:"
+    )
+
+    print(
+        RAW_EVENT_DIR
+        / "elections.csv"
+    )
+
+    print(
+        RAW_EVENT_DIR
+        / "covid_restrictions.csv"
+    )
+
+    print(
+        RAW_EVENT_DIR
+        / "football.csv"
+    )
+
+    print(
+        PROCESSED_DIR
+        / "events.csv"
+    )
+
+    print(
+        PROCESSED_DIR
+        / "event_daily_features.csv"
     )
 
 
