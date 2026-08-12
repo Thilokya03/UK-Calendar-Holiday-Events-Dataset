@@ -1,0 +1,59 @@
+name: ML Training Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+  paths:
+      - "data/**"
+      - "src/**"
+      - "tests/**"
+      - "requirements.txt"
+
+
+  scheduler:
+    - cron: '0 0 5 * 6'
+
+  workflow_dispatch:
+  
+jobs:
+  validate code:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip 
+          pip install  -r requirements.txt
+
+      - name: run calendar set
+        run:  python src/calendar/basic_calender.py
+
+      - name: Run collectores
+        run:  |
+          python src/collectors/event_pipeline.py
+          python src/collectors/extract_economic_data.py
+          python src/collectors/historical_holiday_collectore.py
+          python src/collectors/holiday_collectore.py
+        
+      - name: Run data merge
+        run: |
+          python src/merge/merge_calendar_features.py
+          python src/merge/merge_economic_features.py
+
+      - name: Run tests and data validate
+        run: pytest tests/ -v
+
+
+
+
