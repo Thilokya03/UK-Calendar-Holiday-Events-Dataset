@@ -21,7 +21,7 @@ on:
 
   schedule:
     # Every Saturday at 00:00 UTC
-    # Saturday at 05:30 AM in Sri Lanka
+    # Every Saturday at 05:30 AM in Sri Lanka
     - cron: "0 0 * * 6"
 
   workflow_dispatch:
@@ -49,12 +49,16 @@ jobs:
       - name: Generate basic calendar
         run: python src/calendar/basic_calender.py
 
-      - name: Collect source data
+      - name: Collect holiday data
         run: |
-          python src/collectors/holiday_collectore.py
-          python src/collectors/historical_holiday_collectore.py
-          python src/collectors/event_pipeline.py
-          python src/collectors/extract_economic_data.py
+          python src/collectors/holiday_collector.py
+          python src/collectors/historical_holiday_collector.py
+
+      - name: Collect event data
+        run: python src/collectors/events_pipeline.py
+
+      - name: Collect economic data
+        run: python src/collectors/extract_economic_data.py
 
       - name: Merge calendar and economic features
         run: |
