@@ -2,7 +2,8 @@ name: UK Dataset Pipeline
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - "data/**"
       - "src/**"
@@ -11,7 +12,8 @@ on:
       - ".github/workflows/**"
 
   pull_request:
-    branches: [main]
+    branches:
+      - main
     paths:
       - "data/**"
       - "src/**"
@@ -21,58 +23,172 @@ on:
 
   schedule:
     # Every Saturday at 00:00 UTC
-    # Every Saturday at 05:30 AM in Sri Lanka
+    # Every Saturday at 05:30 AM Sri Lanka time
     - cron: "0 0 * * 6"
 
   workflow_dispatch:
 
+# CI only needs to read repository contents.
+permissions:
+  contents: read
+
+# Prevent two pipeline runs for the same branch/ref
+# from running at the same time.
+concurrency:
+  group: uk-dataset-pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+
 jobs:
-  validate-code:
+
+  generate-and-validate:
+
     name: Generate and Validate Datasets
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
+      # =========================================================
+      # 1. Checkout repository
+      # =========================================================
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+
+      # =========================================================
+      # 2. Set up Python
+      # =========================================================
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: requirements.txt
 
+
+      # =========================================================
+      # 3. Install dependencies
+      # =========================================================
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Generate basic calendar
-        run: python src/calendar/basic_calender.py
 
+      # =========================================================
+      # 4. Generate base calendar
+      # =========================================================
+      - name: Generate basic calendar
+        run: |
+          python src/calendar/basic_calender.py
+
+
+      # =========================================================
+      # 5. Collect holiday data
+      # =========================================================
       - name: Collect holiday data
         run: |
           python src/collectors/holiday_collector.py
           python src/collectors/historical_holiday_collector.py
 
+
+      # =========================================================
+      # 6. Collect event data
+      # =========================================================
       - name: Collect event data
-        run: python src/collectors/events_pipeline.py
+        run: |
+          python src/collectors/events_pipeline.py
 
+
+      # =========================================================
+      # 7. Collect economic data
+      # =========================================================
       - name: Collect economic data
-        run: python src/collectors/extract_economic_data.py
+        run: |
+          python src/collectors/extract_economic_data.py
 
-      - name: Merge calendar and economic features
+
+      # =========================================================
+      # 8. Merge datasets
+      # =========================================================
+      - name: Merge calendar features
         run: |
           python src/merge/merge_calendar_features.py
+
+      - name: Merge economic features
+        run: |
           python src/merge/merge_economic_features.py
 
-      - name: Run tests and validate datasets
-        run: python -m pytest tests/ -v
 
-      - name: Upload generated datasets
-        if: success()
-        uses: actions/upload-artifact@v4
+      # =========================================================
+      # 9. Run validation tests
+      # =========================================================
+      - name: Run tests and validate datasets
+        run: |
+          python -m pytest tests/ -v
+
+
+      # =========================================================
+      # 10. Verify final datasets exist
+      # =========================================================
+      - name: Verify generated datasets
+        run: |
+          if [ ! -f "data/processed/full_calendar_features.csv" ]; then
+            echo "ERROR: full_calendar_features.csv was not generated."
+            exit 1
+          fi
+
+          if [ ! -f "data/processed/uk_economic_features_daily.csv" ]; then
+            echo "ERROR: uk_economic_features_daily.csv was not generated."
+            exit 1
+          fi
+
+          echo "Final datasets generated successfully."
+
+          ls -lh \
+            data/processed/full_calendar_features.csv \
+            data/processed/uk_economic_features_daily.csv
+
+
+      # =========================================================
+      # 11. Prepare release artifact
+      # =========================================================
+      - name: Prepare dataset artifact
+        run: |
+          rm -rf release_artifact
+          mkdir -p release_artifact
+
+          cp \
+            data/processed/full_calendar_features.csv \
+            release_artifact/
+
+          cp \
+            data/processed/uk_economic_features_daily.csv \
+            release_artifact/
+
+          cd release_artifact
+
+          sha256sum \
+            full_calendar_features.csv \
+            uk_economic_features_daily.csv \
+            > SHA256SUMS.txt
+
+          echo ""
+          echo "Generated SHA256 checksums:"
+          cat SHA256SUMS.txt
+
+
+      # =========================================================
+      # 12. Upload validated datasets
+      #
+      # CD will download THIS exact artifact.
+      # =========================================================
+      - name: Upload validated datasets
+        uses: actions/upload-artifact@v7
         with:
           name: uk-calendar-economic-datasets
-          path: data/processed/
+          path: release_artifact/
           if-no-files-found: error
           retention-days: 30
+          compression-level: 6
